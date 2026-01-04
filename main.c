@@ -1,83 +1,196 @@
 #include <windows.h>
 #include <wininet.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdbool.h>
 
 #pragma comment(lib, "wininet.lib")
-char* str_replace(char* source, const char* target, const char* replacement) {
-    if (!source || !target || !replacement) return NULL;
-    char *result, *ins, *tmp;
-    int len_target = strlen(target), len_repl = strlen(replacement), len_front, count;
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
-    ins = source;
-    for (count = 0; (tmp = strstr(ins, target)); ++count) ins = tmp + len_target;
+#define CHECK_ALLOC(ptr) if (!(ptr)) { \
+    fprintf(stderr, "Memory allocation failed at %s:%d\n", __FILE__, __LINE__); \
+    return NULL; \
+}
 
-    tmp = result = malloc(strlen(source) + (len_repl - len_target) * count + 1);
-    if (!result) return NULL;
+char* str_replace(const char* source, const char* target, const char* replacement);
+bool download_and_stamp(const char* id, const char* year, const char* owner, const char* out_filename);
+void show_help(const char* exe_name);
+void cleanup_resources(HINTERNET hUrl, HINTERNET hInternet);
 
-    while (count--) {
-        ins = strstr(source, target);
-        len_front = ins - source;
-        tmp = strncpy(tmp, source, len_front) + len_front;
-        tmp = strcpy(tmp, replacement) + len_repl;
-        source += len_front + len_target;
+char* str_replace(const char* source, const char* target, const char* replacement) {
+    if (!source || !target || !replacement || strlen(target) == 0) {
+        return _strdup(source ? source : "");
     }
-    strcpy(tmp, source);
+    
+    size_t len_target = strlen(target);
+    size_t len_repl = strlen(replacement);
+    size_t len_source = strlen(source);
+    
+    const char* ins = source;
+    size_t count = 0;
+    while ((ins = strstr(ins, target)) != NULL) {
+        count++;
+        ins += len_target;
+    }
+    
+    size_t len_result = len_source + (len_repl - len_target) * count;
+    char* result = (char*)malloc(len_result + 1);
+    CHECK_ALLOC(result);
+    
+    char* dest = result;
+    const char* src = source;
+    
+    while (count--) {
+        const char* found = strstr(src, target);
+        size_t len_front = found - src;
+        memcpy(dest, src, len_front);
+        dest += len_front;
+        memcpy(dest, replacement, len_repl);
+        dest += len_repl;
+        src = found + len_target;
+    }
+    strcpy(dest, src);
+    
     return result;
 }
 
-void download_and_stamp(const char* id, const char* year, const char* owner) {
-    HINTERNET hInternet = InternetOpenA("SPDX-Generator", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
-    if (!hInternet) return;
+bool download_and_stamp(const char* id, const char* year, const char* owner, const char* out_filename) {
+    HINTERNET hInternet = NULL;
+    HINTERNET hUrl = NULL;
+    char *s1 = NULL, *s2 = NULL, *s3 = NULL, *final_text = NULL;
+    FILE* fp = NULL;
 
-    char url[256];
-    sprintf(url, "https://raw.githubusercontent.com/spdx/license-list-data/master/text/%s.txt", id);
+    hInternet = InternetOpenA("SPDX-licgenerator/1.0", 
+                              INTERNET_OPEN_TYPE_PRECONFIG, 
+                              NULL, NULL, 0);
+    if (!hInternet) {
+        fprintf(stderr, "Error: InternetOpenA failed (Error: %lu)\n", GetLastError());
+        return false;
+    }
 
-    HINTERNET hUrl = InternetOpenUrlA(hInternet, url, NULL, 0, INTERNET_FLAG_RELOAD, 0);
+    DWORD timeout = 5000;
+    InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeout, sizeof(timeout));
+    InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeout, sizeof(timeout));
+
+    char url[512];
+    _snprintf_s(url, sizeof(url), _TRUNCATE,
+                "https://raw.githubusercontent.com/spdx/license-list-data/master/text/%s.txt",
+                id);
+    
+    hUrl = InternetOpenUrlA(hInternet, url, NULL, 0,
+                           INTERNET_FLAG_RELOAD | 
+                           INTERNET_FLAG_NO_CACHE_WRITE |
+                           INTERNET_FLAG_SECURE,
+                           0);
+    
     if (!hUrl) {
-        fprintf(stderr, "Error: Could not find SPDX ID '%s'.\n", id);
-        InternetCloseHandle(hInternet);
-        return;
+        DWORD error = GetLastError();
+        fprintf(stderr, "Error: Could not fetch SPDX license '%s' (Error: %lu).\n", id, error);
+        cleanup_resources(hUrl, hInternet);
+        return false;
     }
 
-    char buffer[65536] = {0}; 
-    DWORD bytesRead;
-    InternetReadFile(hUrl, buffer, sizeof(buffer) - 1, &bytesRead);
-    char* s1 = str_replace(buffer, "<year>", year);
-    char* s2 = str_replace(s1 ? s1 : buffer, "[year]", year);
-    char* s3 = str_replace(s2 ? s2 : buffer, "<copyright holders>", owner);
-    char* final_text = str_replace(s3 ? s3 : buffer, "[fullname]", owner);
-    FILE* fp = fopen("LICENSE.md", "w");
-    if (fp) {
-        fprintf(fp, "# %s License\n\n%s", id, final_text ? final_text : buffer);
-        fclose(fp);
-        printf("Successfully generated LICENSE.md (%s) for %s\n", id, owner);
+    DWORD statusCode = 0;
+    DWORD statusSize = sizeof(statusCode);
+    if (HttpQueryInfoA(hUrl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &statusCode, &statusSize, NULL)) {
+        if (statusCode != 200) {
+            fprintf(stderr, "Error: HTTP %lu - License '%s' not found.\n", statusCode, id);
+            cleanup_resources(hUrl, hInternet);
+            return false;
+        }
     }
+    
+    char buffer[65536] = {0};
+    DWORD bytesRead = 0;
+    size_t totalRead = 0;
+    
+    while (InternetReadFile(hUrl, buffer + totalRead, sizeof(buffer) - totalRead - 1, &bytesRead) && bytesRead > 0) {
+        totalRead += bytesRead;
+        if (totalRead >= sizeof(buffer) - 1) break;
+    }
+    
+    buffer[totalRead] = '\0';
+    s1 = str_replace(buffer, "<year>", year);
+    s2 = str_replace(s1, "[year]", year);
+    s3 = str_replace(s2, "<copyright holders>", owner);
+    final_text = str_replace(s3, "[fullname]", owner);
+
+    fp = fopen(out_filename, "wb");
+    if (!fp) {
+        fprintf(stderr, "Error: Could not create %s file.\n", out_filename);
+        goto cleanup;
+    }
+
+    fprintf(fp, "# %s License\n\n%s", id, final_text);
+    fprintf(fp, "\n---\nGenerated by SPDX License Generator\n");
+    fprintf(fp, "SPDX Identifier: %s\nYear: %s\nCopyright Holder: %s\n", id, year, owner);
+    fprintf(fp, "Generation Date: %s", ctime(&(time_t){time(NULL)}));
+    fclose(fp);
+
+    printf("\n========================================\n");
+    printf("Successfully generated %s\n", out_filename);
+    printf("========================================\n");
+    printf("License: %s\nYear: %s\nOwner:   %s\n", id, year, owner);
+    printf("========================================\n\n");
+
+cleanup:
     free(s1); free(s2); free(s3); free(final_text);
-    InternetCloseHandle(hUrl); InternetCloseHandle(hInternet);
+    cleanup_resources(hUrl, hInternet);
+    return true;
 }
 
-int main(int argc, char *argv[]) {
+void cleanup_resources(HINTERNET hUrl, HINTERNET hInternet) {
+    if (hUrl) InternetCloseHandle(hUrl);
+    if (hInternet) InternetCloseHandle(hInternet);
+}
+
+void show_help(const char* exe_name) {
+    const char* base_name = strrchr(exe_name, '\\');
+    if (base_name) base_name++; else base_name = exe_name;
+
+    printf("SPDX License Generator\n");
+    printf("=======================\n\n");
+    printf("Usage: %s <SPDX-ID> <Year> \"<Owner Name>\" [Output-File]\n\n", base_name);
+    printf("Arguments:\n");
+    printf("  SPDX-ID    License identifier (e.g., MIT, Apache-2.0)\n");
+    printf("  Year       Copyright year (use '.' for current year)\n");
+    printf("  Owner      Copyright holder name\n");
+    printf("  Output     Optional: Custom filename (default: LICENSE.md)\n\n");
+}
+
+int main(int argc, char* argv[]) {
     if (argc < 4) {
-        printf("Usage: %s <SPDX-ID> <Year> \"<Owner Name>\"\n", argv[0]);
-        printf("Hint: Use '.' for the current year.\n");
-        printf("Example: %s MIT 2026 \"John Doe\"\n", argv[0]);
+        show_help(argv[0]);
         return 1;
     }
-    char *id = argv[1];
-    char year_buf[5];
-    char *owner = argv[3];
+    
+    char* id = argv[1];
+    char* year_arg = argv[2];
+    char* owner = argv[3];
+    char* out_filename = (argc >= 5) ? argv[4] : "LICENSE.md";
 
-    // automagical year detection
-    if (strcmp(argv[2], ".") == 0) {
+    char year_buf[16] = {0};
+    if (strcmp(year_arg, ".") == 0) {
         time_t t = time(NULL);
-        struct tm tm = *localtime(&t);
-        sprintf(year_buf, "%d", tm.tm_year + 1900);
+        struct tm tm_info;
+        localtime_s(&tm_info, &t);
+        _snprintf_s(year_buf, sizeof(year_buf), _TRUNCATE, "%d", tm_info.tm_year + 1900);
     } else {
-        strncpy(year_buf, argv[2], 4);
-        year_buf[4] = '\0';
+        _snprintf_s(year_buf, sizeof(year_buf), _TRUNCATE, "%s", year_arg);
     }
-    download_and_stamp(id, year_buf, owner);
+
+    if (!download_and_stamp(id, year_buf, owner, out_filename)) return 1;
+
+    printf("Would you like to open %s? (y/N): ", out_filename);
+    char response[16];
+    if (fgets(response, sizeof(response), stdin)) {
+        if (response[0] == 'y' || response[0] == 'Y') {
+            ShellExecuteA(NULL, "open", out_filename, NULL, NULL, SW_SHOW);
+        }
+    }
+    
     return 0;
 }
